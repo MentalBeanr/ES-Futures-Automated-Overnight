@@ -1,0 +1,494 @@
+//@version=5
+strategy(
+     title             = "ES Futures Overnight MACD-V Strategy v2 (Key Level Confluence)",
+     overlay           = true,
+     margin_long       = 100,
+     margin_short      = 100,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     commission_type   = strategy.commission.cash_per_contract,
+     commission_value  = 2.0
+     )
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  INPUTS
+// ╚══════════════════════════════════════════════════════════════╝
+
+// ── MACD-V ──────────────────────────────────────────────────────
+macdFast   = input.int(12,    "MACD Fast Length",   group="MACD-V")
+macdSlow   = input.int(26,    "MACD Slow Length",   group="MACD-V")
+macdSignal = input.int(9,     "MACD Signal Length", group="MACD-V")
+atrLen     = input.int(14,    "ATR Length",         group="MACD-V")
+macdVScale = input.float(100.0,"MACD-V Scale Factor",step=1.0, group="MACD-V")
+
+// ── THRESHOLDS ──────────────────────────────────────────────────
+shortThresh = input.float( 55.0, "Short Threshold (MACD-V crosses below)", group="Thresholds")
+longThresh  = input.float(-55.0, "Long  Threshold (MACD-V crosses above)", group="Thresholds")
+
+// ── EMA / ATR ───────────────────────────────────────────────────
+emaLen      = input.int(9,   "EMA Length",          group="Indicators")
+atrStopMult = input.float(3.0,"ATR Stop Multiplier", group="Indicators")
+
+// ── SWING PIVOT ─────────────────────────────────────────────────
+swingLookback = input.int(5, "Swing Pivot Strength (bars each side)", minval=1, maxval=7, group="Stop Loss")
+slBuffer      = input.float(1.75, "SL Buffer beyond Pivot (pts)", group="Stop Loss")
+
+// ── SESSION ──────────────────────────────────────────────────────
+// CME Globex charts in TradingView use CT (America/Chicago) as the exchange timezone.
+// All session strings and hour/minute comparisons below are in CT.
+// CST = UTC-6 | CDT = UTC-5 — TradingView handles DST automatically.
+//
+// Entry window : 5:00 PM CT to 7:30 AM CT  (no new entries after 7:30 AM)
+// Hard exit    : 8:25 AM CT  (force-close any open trade regardless)
+// Full ETH     : 5:00 PM CT to 8:25 AM CT  (background shading)
+
+sessionOpen  = input.session("1700-0730", "Entry Session (CT)",
+     tooltip="New entries allowed 5:00 PM to 7:30 AM CT",
+     group="Session")
+sessionFull  = input.session("1700-0825", "Full ETH Session (CT)",
+     tooltip="Full ETH window for background shading 5:00 PM to 8:25 AM CT",
+     group="Session")
+hardExitHour   = input.int(8,  "Hard Exit Hour CT",   minval=0, maxval=23, group="Session")
+hardExitMinute = input.int(25, "Hard Exit Minute CT", minval=0, maxval=59, group="Session")
+
+// ── KEY LEVEL SETTINGS ──────────────────────────────────────────
+levelTolerance = input.float(2.0, "Key Level Proximity Tolerance (pts)",
+     tooltip="How close price must get to a level to be considered 'reacting'",
+     group="Key Levels")
+
+// RTH session for PDH/PDL and overnight high/low detection
+// RTH = 14:30–21:00 UTC  (8:30 AM–3:00 PM CT)
+rthSession = input.session("1430-2100", "RTH Session (UTC) for PDH/PDL",
+     group="Key Levels")
+
+// Volume profile approximation lookback
+vpLookback  = input.int(50,  "Volume Profile Lookback (bars)",  group="Key Levels", minval=10)
+vpBins      = input.int(20,  "Volume Profile Bins",             group="Key Levels", minval=5, maxval=40)
+vp5dLookback= input.int(250, "5-Day Volume Profile Lookback (bars)", group="Key Levels", minval=50)
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  CORE INDICATORS
+// ╚══════════════════════════════════════════════════════════════╝
+
+atr       = ta.atr(atrLen)
+[macdLine, _macdSignalLine, _macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+macdV     = (atr != 0) ? (macdLine / atr) * macdVScale : 0.0
+ema9      = ta.ema(close, emaLen)
+vwapLine  = ta.vwap(hlc3)
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  SESSION FILTER
+// ╚══════════════════════════════════════════════════════════════╝
+
+// inSession gates new entries (5 PM to 7:30 AM CT)
+inSession    = not na(time(timeframe.period, sessionOpen))
+// inSessionFull used for background shading (5 PM to 8:25 AM CT)
+inSessionFull = not na(time(timeframe.period, sessionFull))
+inRTH        = not na(time(timeframe.period, rthSession))
+
+// Hard exit: force-close any open trade at 8:25 AM CT
+// Use a 5-minute window to ensure the close fires on the correct bar
+currentTimeCT  = hour * 60 + minute
+hardExitTimeCT = hardExitHour * 60 + hardExitMinute
+hardExitNow    = currentTimeCT >= hardExitTimeCT and currentTimeCT < hardExitTimeCT + 5
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  KEY LEVELS — PREVIOUS DAY HIGH / LOW
+// ╚══════════════════════════════════════════════════════════════╝
+
+// Detect the start of a new RTH session (rising edge)
+rthStart = inRTH and not inRTH[1]
+
+var float pdHigh = na
+var float pdLow  = na
+var float rthSessionHigh = na
+var float rthSessionLow  = na
+
+// Track intraday RTH high/low, then save when session closes
+if rthStart
+    // Save yesterday's RTH range as PDH/PDL
+    if not na(rthSessionHigh)
+        pdHigh := rthSessionHigh
+    if not na(rthSessionLow)
+        pdLow  := rthSessionLow
+    // Reset for new session
+    rthSessionHigh := high
+    rthSessionLow  := low
+else if inRTH
+    rthSessionHigh := math.max(rthSessionHigh, high)
+    rthSessionLow  := math.min(rthSessionLow,  low)
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  KEY LEVELS — OVERNIGHT HIGH / LOW  (ETH = outside RTH)
+// ╚══════════════════════════════════════════════════════════════╝
+
+inETH = not inRTH   // Everything outside RTH = extended / overnight
+
+var float ethHigh = na
+var float ethLow  = na
+var float ethSessionHigh = na
+var float ethSessionLow  = na
+
+// ETH session starts when RTH ends
+ethStart = inETH and not inETH[1]
+
+if ethStart
+    if not na(ethSessionHigh)
+        ethHigh := ethSessionHigh
+    if not na(ethSessionLow)
+        ethLow  := ethSessionLow
+    ethSessionHigh := high
+    ethSessionLow  := low
+else if inETH
+    ethSessionHigh := math.max(ethSessionHigh, high)
+    ethSessionLow  := math.min(ethSessionLow,  low)
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  KEY LEVELS — VOLUME PROFILE  (Previous Day VAH / VAL / POC)
+//  Pine Script cannot natively access tick volume per price level,
+//  so we approximate using a bar-weighted high-low bin method.
+//  Each bar's volume is distributed across the price range it covers.
+// ╚══════════════════════════════════════════════════════════════╝
+
+f_vpLevels(lookback, bins) =>
+    var float _poc = na
+    var float _vah = na
+    var float _val = na
+
+    // Price range over lookback
+    _highest = ta.highest(high, lookback)
+    _lowest  = ta.lowest(low,   lookback)
+    _range   = _highest - _lowest
+
+    if _range > 0
+        _binSize = _range / bins
+
+        // Accumulate volume per bin
+        // We use arrays — Pine allows up to 'bins' iterations
+        volBins  = array.new_float(bins, 0.0)
+
+        for i = 0 to lookback - 1
+            barHigh = high[i]
+            barLow  = low[i]
+            barVol  = volume[i]
+            barRange = barHigh - barLow
+            if barRange > 0
+                for b = 0 to bins - 1
+                    binLow  = _lowest + b * _binSize
+                    binHigh = binLow + _binSize
+                    overlap = math.max(0.0, math.min(barHigh, binHigh) - math.max(barLow, binLow))
+                    array.set(volBins, b, array.get(volBins, b) + barVol * (overlap / barRange))
+
+        // Find POC (bin with highest volume)
+        maxVol   = array.max(volBins)
+        pocBin   = array.indexof(volBins, maxVol)
+        _poc    := _lowest + (pocBin + 0.5) * _binSize
+
+        // Value Area = 70% of total volume surrounding POC
+        totalVol   = array.sum(volBins)
+        vaTarget   = totalVol * 0.70
+        vaVol      = maxVol
+        vaLow      = pocBin
+        vaHigh     = pocBin
+
+        // Expand outward from POC until 70% captured
+        while vaVol < vaTarget
+            addLow  = vaLow  > 0        ? array.get(volBins, vaLow  - 1) : 0.0
+            addHigh = vaHigh < bins - 1 ? array.get(volBins, vaHigh + 1) : 0.0
+            if addLow >= addHigh and vaLow > 0
+                vaLow  -= 1
+                vaVol  += addLow
+            else if vaHigh < bins - 1
+                vaHigh += 1
+                vaVol  += addHigh
+            else
+                break
+
+        _val := _lowest + vaLow  * _binSize
+        _vah := _lowest + (vaHigh + 1) * _binSize
+
+    [_poc, _vah, _val]
+
+// Previous-day VP (1-day lookback approximated by vpLookback bars)
+[pdPOC, pdVAH, pdVAL] = f_vpLevels(vpLookback, vpBins)
+
+// 5-Day VP
+[vp5POC, vp5VAH, vp5VAL] = f_vpLevels(vp5dLookback, vpBins)
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  KEY LEVEL REACTION LOGIC
+//
+//  A "reaction" at a level is detected when ANY of:
+//  1. Wick rejection  — candle wicks into zone, body closes away
+//  2. Body rejection  — full body closes away from level
+//  3. Sweep & reverse — price sweeps past level then closes back
+//  4. Touch / proximity — price came within tolerance (softest filter)
+//
+//  Additionally: if price BREAKS through a level, we wait for a
+//  retest of that level from the other side before allowing entry.
+// ╚══════════════════════════════════════════════════════════════╝
+
+// Helper: is price within tolerance of a level?
+f_nearLevel(lvl) =>
+    not na(lvl) and math.abs(close - lvl) <= levelTolerance
+
+// Helper: candle wicked into level zone but body closed away
+// For a SHORT reaction (at resistance): wick above level, body below
+f_wickRejectionBear(lvl) =>
+    not na(lvl) and high >= lvl - levelTolerance and math.max(open, close) < lvl + levelTolerance
+
+// For a LONG reaction (at support): wick below level, body above
+f_wickRejectionBull(lvl) =>
+    not na(lvl) and low <= lvl + levelTolerance and math.min(open, close) > lvl - levelTolerance
+
+// Helper: liquidity sweep — previous bar swept level, current bar closed back
+f_sweepBear(lvl) =>
+    not na(lvl) and high[1] > lvl and close < lvl   // swept above, closed below
+
+f_sweepBull(lvl) =>
+    not na(lvl) and low[1]  < lvl and close > lvl   // swept below, closed above
+
+// ── Collect all active levels ────────────────────────────────────
+// Build array of levels to check
+allLevels = array.new_float(0)
+
+if not na(pdHigh)
+    array.push(allLevels, pdHigh)
+if not na(pdLow)
+    array.push(allLevels, pdLow)
+if not na(ethHigh)
+    array.push(allLevels, ethHigh)
+if not na(ethLow)
+    array.push(allLevels, ethLow)
+if not na(pdPOC)
+    array.push(allLevels, pdPOC)
+if not na(pdVAH)
+    array.push(allLevels, pdVAH)
+if not na(pdVAL)
+    array.push(allLevels, pdVAL)
+if not na(vp5POC)
+    array.push(allLevels, vp5POC)
+if not na(vp5VAH)
+    array.push(allLevels, vp5VAH)
+if not na(vp5VAL)
+    array.push(allLevels, vp5VAL)
+
+// ── Reaction detection across all levels ────────────────────────
+bearReactionAtLevel = false
+bullReactionAtLevel = false
+
+if array.size(allLevels) > 0
+    for i = 0 to array.size(allLevels) - 1
+        lvl = array.get(allLevels, i)
+        // Bearish reactions (price at resistance → expect down move)
+        if f_wickRejectionBear(lvl) or f_sweepBear(lvl) or f_nearLevel(lvl)
+            bearReactionAtLevel := true
+        // Bullish reactions (price at support → expect up move)
+        if f_wickRejectionBull(lvl) or f_sweepBull(lvl) or f_nearLevel(lvl)
+            bullReactionAtLevel := true
+
+// ── Break & Retest filter ────────────────────────────────────────
+// If price has cleanly broken through a level (closed on the other side
+// by more than tolerance), we require a retest before allowing a signal.
+// We track this with a "waiting for retest" state per direction.
+
+var bool waitingForBearRetest = false
+var bool waitingForBullRetest = false
+var float retestLevelBear     = na
+var float retestLevelBull     = na
+
+// Check if price broke through any level decisively this bar
+if array.size(allLevels) > 0
+    for i = 0 to array.size(allLevels) - 1
+        lvl = array.get(allLevels, i)
+        // Bearish break: price closed below level by more than tolerance
+        if close < lvl - levelTolerance and close[1] >= lvl - levelTolerance
+            waitingForBearRetest := true
+            retestLevelBear      := lvl
+        // Bullish break: price closed above level by more than tolerance
+        if close > lvl + levelTolerance and close[1] <= lvl + levelTolerance
+            waitingForBullRetest := true
+            retestLevelBull      := lvl
+
+// Retest satisfied when price returns within tolerance of broken level
+if waitingForBearRetest and not na(retestLevelBear)
+    if math.abs(close - retestLevelBear) <= levelTolerance
+        waitingForBearRetest := false
+
+if waitingForBullRetest and not na(retestLevelBull)
+    if math.abs(close - retestLevelBull) <= levelTolerance
+        waitingForBullRetest := false
+
+// Final level confluence gate
+// Bearish entry: need bear reaction AND not currently mid-break-waiting-retest in bull direction
+levelConfirmShort = bearReactionAtLevel and not waitingForBullRetest
+levelConfirmLong  = bullReactionAtLevel and not waitingForBearRetest
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  MACD-V SIGNAL (unchanged from v1)
+// ╚══════════════════════════════════════════════════════════════╝
+
+bearCross = ta.crossunder(macdV, shortThresh)
+bullCross = ta.crossover(macdV,  longThresh)
+
+var bool bearSignalActive = false
+var bool bullSignalActive = false
+
+if bearCross
+    bearSignalActive := true
+if bullCross
+    bullSignalActive := true
+
+if bearSignalActive and (macdV > macdV[1])
+    bearSignalActive := false
+if bullSignalActive and (macdV < macdV[1])
+    bullSignalActive := false
+if strategy.position_size > 0
+    bearSignalActive := false
+if strategy.position_size < 0
+    bullSignalActive := false
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  CANDLE BODY FILTER  (unchanged from v1)
+// ╚══════════════════════════════════════════════════════════════╝
+
+bodyTop = math.max(open, close)
+bodyBot = math.min(open, close)
+bodyMid = (bodyTop + bodyBot) / 2.0
+
+shortBodyFilter = bodyMid < ema9 and bodyMid < vwapLine
+longBodyFilter  = bodyMid > ema9 and bodyMid > vwapLine
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  ENTRY CONDITIONS  — all filters must align
+// ╚══════════════════════════════════════════════════════════════╝
+
+shortEntry = bearSignalActive   and
+             shortBodyFilter    and
+             levelConfirmShort  and          // ← NEW: key level confluence
+             strategy.position_size == 0 and
+             inSession
+
+longEntry  = bullSignalActive   and
+             longBodyFilter     and
+             levelConfirmLong   and          // ← NEW: key level confluence
+             strategy.position_size == 0 and
+             inSession
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  STOP LOSS
+// ╚══════════════════════════════════════════════════════════════╝
+
+swingHigh = ta.pivothigh(high, swingLookback, swingLookback)
+swingLow  = ta.pivotlow (low,  swingLookback, swingLookback)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if not na(swingHigh)
+    lastSwingHigh := swingHigh
+if not na(swingLow)
+    lastSwingLow  := swingLow
+
+shortSL_pivot = na(lastSwingHigh) ? na : lastSwingHigh + slBuffer
+shortSL_atr   = close + atr * atrStopMult
+shortSL       = na(shortSL_pivot) ? shortSL_atr : math.max(shortSL_pivot, shortSL_atr)
+
+longSL_pivot  = na(lastSwingLow)  ? na : lastSwingLow  - slBuffer
+longSL_atr    = close - atr * atrStopMult
+longSL        = na(longSL_pivot)  ? longSL_atr : math.min(longSL_pivot, longSL_atr)
+
+var float entryShortSL = na
+var float entryLongSL  = na
+var float entryPrice   = na
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  EXECUTE ENTRIES
+// ╚══════════════════════════════════════════════════════════════╝
+
+if shortEntry
+    entryPrice   := close
+    entryShortSL := shortSL
+    strategy.entry("Short", strategy.short)
+
+if longEntry
+    entryPrice  := close
+    entryLongSL := longSL
+    strategy.entry("Long", strategy.long)
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  TAKE PROFIT  (1:2 R:R)
+// ╚══════════════════════════════════════════════════════════════╝
+
+shortRisk = na(entryShortSL) ? na : math.abs(entryPrice - entryShortSL)
+shortTP   = na(shortRisk)    ? na : entryPrice - shortRisk * 2.0
+
+longRisk  = na(entryLongSL)  ? na : math.abs(entryPrice - entryLongSL)
+longTP    = na(longRisk)     ? na : entryPrice + longRisk  * 2.0
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  EXITS
+// ╚══════════════════════════════════════════════════════════════╝
+
+macdVCrossZeroBull = ta.crossover(macdV,  0)
+macdVCrossZeroBear = ta.crossunder(macdV, 0)
+
+if hardExitNow and strategy.position_size != 0
+    strategy.close_all(comment="Hard Time Exit")
+
+if strategy.position_size < 0
+    strategy.exit("Short Exit", from_entry="Short", stop=entryShortSL, limit=shortTP, comment="SL/TP")
+    if macdVCrossZeroBull
+        strategy.close("Short", comment="MACD-V Zero Cross")
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit",  from_entry="Long",  stop=entryLongSL,  limit=longTP,  comment="SL/TP")
+    if macdVCrossZeroBear
+        strategy.close("Long",  comment="MACD-V Zero Cross")
+
+// ╔══════════════════════════════════════════════════════════════╗
+//  PLOTS
+// ╚══════════════════════════════════════════════════════════════╝
+
+// Core indicators
+plot(ema9,     "9 EMA", color=color.orange, linewidth=1)
+plot(vwapLine, "VWAP",  color=color.aqua,   linewidth=1)
+
+// ── Key Levels ───────────────────────────────────────────────────
+// Previous Day
+plot(pdHigh,  "PDH",    color=color.new(color.red,    30), linewidth=1, style=plot.style_stepline)
+plot(pdLow,   "PDL",    color=color.new(color.green,  30), linewidth=1, style=plot.style_stepline)
+
+// Overnight
+plot(ethHigh, "ON High",color=color.new(color.fuchsia,30), linewidth=1, style=plot.style_stepline)
+plot(ethLow,  "ON Low", color=color.new(color.blue,   30), linewidth=1, style=plot.style_stepline)
+
+// Previous Day Volume Profile
+plot(pdVAH,   "PD VAH", color=color.new(color.yellow, 20), linewidth=1, style=plot.style_stepline)
+plot(pdVAL,   "PD VAL", color=color.new(color.yellow, 20), linewidth=1, style=plot.style_stepline)
+plot(pdPOC,   "PD POC", color=color.new(color.white,  10), linewidth=2, style=plot.style_stepline)
+
+// 5-Day Volume Profile
+plot(vp5VAH,  "5D VAH", color=color.new(color.teal,   30), linewidth=1, style=plot.style_stepline)
+plot(vp5VAL,  "5D VAL", color=color.new(color.teal,   30), linewidth=1, style=plot.style_stepline)
+plot(vp5POC,  "5D POC", color=color.new(color.lime,   10), linewidth=2, style=plot.style_stepline)
+
+// Entry markers
+plotshape(shortEntry, "Short Entry", location=location.abovebar,
+          style=shape.triangledown, color=color.red,   size=size.small)
+plotshape(longEntry,  "Long Entry",  location=location.belowbar,
+          style=shape.triangleup,   color=color.green, size=size.small)
+
+// SL / TP for active position
+plot(strategy.position_size < 0 ? entryShortSL : na, "Short SL", color=color.red,   style=plot.style_linebr)
+plot(strategy.position_size < 0 ? shortTP       : na, "Short TP", color=color.green, style=plot.style_linebr)
+plot(strategy.position_size > 0 ? entryLongSL   : na, "Long SL",  color=color.red,   style=plot.style_linebr)
+plot(strategy.position_size > 0 ? longTP         : na, "Long TP",  color=color.green, style=plot.style_linebr)
+
+// Session background
+bgcolor(inSessionFull ? color.new(color.blue, 92) : na, title="ETH Session")
+
+// ── Debug labels (toggle off in production) ──────────────────────
+// Uncomment below to see which level triggered a reaction on entries
+// if shortEntry or longEntry
+//     label.new(bar_index, high, "Level hit", style=label.style_label_down, color=color.gray)
